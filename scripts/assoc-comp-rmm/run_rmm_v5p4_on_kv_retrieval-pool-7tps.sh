@@ -35,6 +35,17 @@ WARMUP=10000
 EVAL_STEPS=500
 EARLY_STOP=500
 
+# ── ClearML ────────────────────────────────────────────────────────────────
+# Configure credentials once with `clearml-init`, or provide the standard
+# CLEARML_API_* environment variables. Set CLEARML_PROJECT="" to disable.
+CLEARML_PROJECT=${CLEARML_PROJECT-"compressing-associations/rmm-v5p4-7tps"}
+CLEARML_TAGS=${CLEARML_TAGS:-"rmm,v5p4,kv-retrieval,7tps"}
+CLEARML_OUTPUT_URI=${CLEARML_OUTPUT_URI:-}
+CLEARML_OUTPUT_ARGS=()
+if [ -n "$CLEARML_OUTPUT_URI" ]; then
+  CLEARML_OUTPUT_ARGS=(--clearml_output_uri "$CLEARML_OUTPUT_URI")
+fi
+
 # ── RMM v5p4 memory path ───────────────────────────────────────────────────
 WRITE_MODE=pool
 READ_MODE=unpool
@@ -96,7 +107,11 @@ for NUM_MEMORY_VECTORS in 2 1; do
               --eval_steps                  $EVAL_STEPS \
               --logging_steps               $EVAL_STEPS \
               --early_stopping_patience     $EARLY_STOP \
-              --seed                        $((142 + N))
+              --seed                        $((142 + N)) \
+              --clearml_project             "$CLEARML_PROJECT" \
+              --clearml_task_name           "${RUN_NAME}-run_${N}" \
+              --clearml_tags                "$CLEARML_TAGS" \
+              "${CLEARML_OUTPUT_ARGS[@]}"
           done
         done
       done

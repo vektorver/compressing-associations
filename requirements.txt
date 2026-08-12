@@ -6,6 +6,7 @@ torch
 transformers
 accelerate
 datasets
+clearml
 flash-linear-attention
 einops
 

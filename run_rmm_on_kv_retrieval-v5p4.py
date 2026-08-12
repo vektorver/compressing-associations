@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 
 import torch
@@ -200,6 +201,83 @@ class CustomTrainer(Trainer):
         return super().log(logs, start_time)
 
 
+class ClearMLMetricsCallback(TrainerCallback):
+    """Report every numeric Trainer log without creating tasks on worker ranks."""
+
+    def __init__(self, task=None):
+        self.clearml_logger = task.get_logger() if task is not None else None
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if self.clearml_logger is None or not state.is_world_process_zero or not logs:
+            return
+        for name, value in logs.items():
+            if not isinstance(value, (int, float, np.number)) or not np.isfinite(value):
+                continue
+            if "_" in name:
+                title, series = name.split("_", 1)
+            else:
+                title, series = "train", name
+            self.clearml_logger.report_scalar(
+                title=title, series=series, value=float(value),
+                iteration=int(state.global_step),
+            )
+
+
+def _git_value(*args):
+    try:
+        result = subprocess.run(
+            ["git", *args], check=True, capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def init_clearml(experiment_args, accelerator):
+    """Create one ClearML task for the whole distributed training run."""
+    if not experiment_args.clearml_project or not accelerator.is_main_process:
+        return None
+    try:
+        from clearml import Task
+    except ImportError as exc:
+        raise RuntimeError(
+            "ClearML logging was requested, but the 'clearml' package is not installed. "
+            "Install it with: pip install clearml"
+        ) from exc
+
+    task_name = experiment_args.clearml_task_name or Path(experiment_args.exp_path).name
+    task = Task.init(
+        project_name=experiment_args.clearml_project,
+        task_name=task_name,
+        output_uri=experiment_args.clearml_output_uri,
+        reuse_last_task_id=False,
+        auto_connect_arg_parser=False,
+        auto_connect_frameworks=True,
+        auto_resource_monitoring=True,
+        auto_connect_streams=True,
+    )
+    task.connect(dict(vars(experiment_args)), name="Arguments")
+    commit = _git_value("rev-parse", "HEAD")
+    branch = _git_value("branch", "--show-current") or _git_value(
+        "rev-parse", "--abbrev-ref", "HEAD"
+    )
+    status = _git_value("status", "--porcelain")
+    repository = {
+        "commit": commit or "unknown",
+        "branch": branch or "unknown",
+        "version": _git_value("describe", "--always", "--tags", "--dirty") or "unknown",
+        "is_dirty": bool(status) if status is not None else "unknown",
+    }
+    task.connect(repository, name="Repository")
+    if experiment_args.clearml_tags:
+        task.set_tags([tag.strip() for tag in experiment_args.clearml_tags.split(",") if tag.strip()])
+    task.get_logger().report_text(
+        "Repository: branch={branch}, commit={commit}, version={version}, "
+        "dirty={is_dirty}".format(**repository)
+    )
+    return task
+
+
 @dataclass
 class ExperimentArgs:
     exp_path:                 str            = field()
@@ -244,6 +322,11 @@ class ExperimentArgs:
     n_pairs:                  Optional[int]  = field(default=None)
     n_keys:                   Optional[int]  = field(default=None)
     n_values:                 Optional[int]  = field(default=None)
+    # ClearML (empty project disables integration)
+    clearml_project:          Optional[str]  = field(default=None)
+    clearml_task_name:        Optional[str]  = field(default=None)
+    clearml_tags:             Optional[str]  = field(default=None)  # comma-separated
+    clearml_output_uri:       Optional[str]  = field(default=None)
 
 
 if __name__ == '__main__':
@@ -257,6 +340,8 @@ if __name__ == '__main__':
 
     logger.info(f'num processes: {accel.num_processes}')
     logger.info(f'mixed precision: {accel.mixed_precision}')
+
+    clearml_task = init_clearml(args, accel)
 
     if accel.is_main_process:
         Path(args.exp_path).mkdir(parents=True, exist_ok=True)
@@ -354,7 +439,16 @@ if __name__ == '__main__':
         print(f"Loaded checkpoint: {model_cpt_path}")
 
     logger.info(f'model: {model}')
-    logger.info(f"parameters: {sum(p.numel() for p in model.parameters()):,}")
+    total_parameters = sum(p.numel() for p in model.parameters())
+    trainable_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"parameters: {total_parameters:,} ({trainable_parameters:,} trainable)")
+    if clearml_task is not None:
+        clearml_task.connect({
+            "class": type(model).__name__,
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+            "configuration": rmm_config.to_dict(),
+        }, name="Model")
 
     # Load or generate dataset
     try:
@@ -378,6 +472,13 @@ if __name__ == '__main__':
         dataset = dataset.train_test_split(test_size=5_000, seed=args.seed)
         dataset = datasets.DatasetDict({"train": dataset["train"], "valid": dataset["test"]})
         dataset.save_to_disk(args.data_path)
+
+    if clearml_task is not None:
+        clearml_task.connect({
+            "path": args.data_path,
+            "train_samples": len(dataset["train"]),
+            "validation_samples": len(dataset["valid"]),
+        }, name="Dataset")
 
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
 
@@ -430,6 +531,7 @@ if __name__ == '__main__':
             EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
             StopOnMetricValue('exact_match',      0.99, higher_is_better=True),
             StopOnMetricValue('exact_match_None', 0.99, higher_is_better=True),
+            ClearMLMetricsCallback(clearml_task),
         ],
     )
     trainer.train()
@@ -437,3 +539,11 @@ if __name__ == '__main__':
     metrics = trainer.evaluate(dataset['valid'])
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
+    if clearml_task is not None:
+        config_path = os.path.join(args.exp_path, 'config.json')
+        metrics_path = os.path.join(args.exp_path, 'all_results.json')
+        if os.path.isfile(config_path):
+            clearml_task.upload_artifact('experiment_config', artifact_object=config_path)
+        if os.path.isfile(metrics_path):
+            clearml_task.upload_artifact('final_metrics', artifact_object=metrics_path)
+        clearml_task.close()
